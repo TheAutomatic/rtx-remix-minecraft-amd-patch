@@ -27,39 +27,39 @@ jobs:
         cmd /c build.cmd
 
     - name: Package Release ZIP
+      id: pkg
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Path staging -Force
+        $ErrorActionPreference = 'Stop'
+        $baseVer = $null
+        if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v?([0-9]+(?:\.[0-9]+)*)') {
+            $baseVer = $Matches[1]
+        }
+        $zipName = if ($baseVer) { "rtx-remix-minecraft-$baseVer-amd-patch.zip" } else { 'rtx-remix-minecraft-amd-patch.zip' }
+        $releaseTitle = if ($baseVer) { "RTX Remix for Minecraft $baseVer - AMD Patch" } else { 'RTX Remix for Minecraft - AMD Patch' }
+        "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "release_title=$releaseTitle" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        New-Item -ItemType Directory -Path staging -Force | Out-Null
         Copy-Item bin/remixbridge.dll staging/
-        Copy-Item bin/remixbridge.pdb staging/
         Copy-Item config/OptiScaler.ini staging/
         Copy-Item LICENSE staging/
         Copy-Item NOTICE staging/
         Copy-Item THIRD_PARTY_LICENSES staging/THIRD_PARTY_LICENSES -Recurse -Force
-        Compress-Archive -Path staging/* -DestinationPath rtx-remix-minecraft-amd-patch.zip
+        Compress-Archive -Path staging/* -DestinationPath $zipName -Force
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
         name: remixbridge-amd
         path: |
-          rtx-remix-minecraft-amd-patch.zip
-          bin/remixbridge.dll
+          ${{ steps.pkg.outputs.zip_name }}
           bin/remixbridge.pdb
-          config/OptiScaler.ini
-          LICENSE
-          NOTICE
 
     - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          rtx-remix-minecraft-amd-patch.zip
-          bin/remixbridge.dll
-          bin/remixbridge.pdb
-          config/OptiScaler.ini
-          LICENSE
-          NOTICE
+        name: ${{ steps.pkg.outputs.release_title }}
+        files: ${{ steps.pkg.outputs.zip_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
