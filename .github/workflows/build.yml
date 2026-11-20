@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Build remixbridge.dll
+      run: |
+        cmd /c build.cmd
+
+    - name: Package Release ZIP
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path staging -Force
+        Copy-Item bin/remixbridge.dll staging/
+        Copy-Item bin/remixbridge.pdb staging/
+        Copy-Item config/OptiScaler.ini staging/
+        Copy-Item LICENSE staging/
+        Copy-Item NOTICE staging/
+        Copy-Item THIRD_PARTY_LICENSES staging/THIRD_PARTY_LICENSES -Recurse -Force
+        Compress-Archive -Path staging/* -DestinationPath rtx-remix-minecraft-amd-patch.zip
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: remixbridge-amd
+        path: |
+          rtx-remix-minecraft-amd-patch.zip
+          bin/remixbridge.dll
+          bin/remixbridge.pdb
+          config/OptiScaler.ini
+          LICENSE
+          NOTICE
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          rtx-remix-minecraft-amd-patch.zip
+          bin/remixbridge.dll
+          bin/remixbridge.pdb
+          config/OptiScaler.ini
+          LICENSE
+          NOTICE
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

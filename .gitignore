@@ -1,0 +1,19 @@
+# Build outputs
+build/
+bin/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# IDE & Editor caches
+.vs/
+*.sln
+*.vcxproj*
+.vscode/
+.idea/
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
