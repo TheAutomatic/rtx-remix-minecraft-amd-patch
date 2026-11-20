@@ -28,12 +28,16 @@
 #include <malloc.h>
 #include <jni.h>
 #include <cstring>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // HACKHACK: link to OpenGL to expose 'glSemaphoreParameterui64vEXT',
@@ -650,6 +654,7 @@ static ATOM s_cleanWndClass = 0;
 static bool s_isChild = false;
 static bool s_wasHostActive = false;
 static bool s_logDirReady = false;
+static std::mutex s_logMutex;
 
 static void LogBridge(const char* fmt, ...) {
     char buf[1024];
@@ -657,6 +662,8 @@ static void LogBridge(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+
+    std::lock_guard<std::mutex> lock(s_logMutex);
     OutputDebugStringA(buf);
     fprintf(stderr, "%s", buf);
     fflush(stderr);
@@ -787,6 +794,1263 @@ static HWND EnsureCleanWindow(HWND hostHwnd) {
     return hwnd;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// AMD Sparse Rendering Wave32 Vulkan Hook (isolated to d3d9.dll IAT)
+//
+// RTX Remix's isSparseRenderingSupported() requires VkPhysicalDeviceSubgroupProperties
+// ::subgroupSize == 32, and its compact_active_pixels.comp.slang compute shader
+// (LocalSize 32x32x1 + OpGroupNonUniformBallot) assumes Wave32 lane masks.
+// On AMD RDNA GPUs reporting default subgroupSize=64 with subgroupSizeControl
+// supporting Wave32, we patch ONLY d3d9.dll's vulkan-1.dll!vkGetInstanceProcAddr
+// IAT slot so d3d9.dll sees subgroupSize=32, enables subgroupSizeControl +
+// computeFullSubgroups cleanly without VUID conflicts (coexisting with
+// OptiScaler VulkanExtensionSpoofing and OpenRR PrepareVkDevice), and forces
+// requiredSubgroupSize=32 + REQUIRE_FULL_SUBGROUPS_BIT exclusively on the
+// matched compact_active_pixels compute pipeline.
+//
+// Kill switch: set REMIX_AMD_SPARSE_WAVE32=0 to disable completely.
+// ════════════════════════════════════════════════════════════════════════════
+namespace amd_sparse_wave32 {
+
+#define VK_HOOK_CALL __stdcall
+
+using VkResult        = int32_t;
+using VkBool32        = uint32_t;
+using VkFlags         = uint32_t;
+using VkStructureType = uint32_t;
+
+struct VkInstance_T;
+struct VkPhysicalDevice_T;
+struct VkDevice_T;
+using VkInstance       = VkInstance_T*;
+using VkPhysicalDevice = VkPhysicalDevice_T*;
+using VkDevice         = VkDevice_T*;
+
+using VkShaderModule   = uint64_t;
+using VkPipelineCache  = uint64_t;
+using VkPipelineLayout = uint64_t;
+using VkPipeline       = uint64_t;
+
+using PFN_vkVoidFunction = void (VK_HOOK_CALL *)(void);
+
+static constexpr VkResult VK_SUCCESS_LOCAL                     = 0;
+static constexpr VkResult VK_INCOMPLETE_LOCAL                  = 5;
+static constexpr VkResult VK_ERROR_INITIALIZATION_FAILED_LOCAL = -3;
+static constexpr VkBool32 VK_FALSE_LOCAL                       = 0u;
+static constexpr VkBool32 VK_TRUE_LOCAL                        = 1u;
+
+static constexpr uint32_t VK_SHADER_STAGE_COMPUTE_BIT_LOCAL = 0x00000020u;
+static constexpr uint32_t VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_LOCAL = 0x00000001u;
+static constexpr uint32_t VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_LOCAL      = 0x00000002u;
+
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_FEATURES_2                         = 1000059000u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_PROPERTIES_2                       = 1000059001u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES                = 1000094000u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES   = 1000225000u;
+static constexpr VkStructureType VK_STYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CI    = 1000225001u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES     = 1000225002u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES                = 53u;
+static constexpr VkStructureType VK_STYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES              = 54u;
+
+static constexpr const char* kSubgroupSizeControlExtName = "VK_EXT_subgroup_size_control";
+static constexpr int kMaxPNextDepth = 128;
+
+struct VkBaseOutStructure {
+    VkStructureType     sType;
+    VkBaseOutStructure* pNext;
+};
+
+struct VkBaseInStructure {
+    VkStructureType          sType;
+    const VkBaseInStructure* pNext;
+};
+
+struct VkApplicationInfo {
+    VkStructureType sType;
+    const void*     pNext;
+    const char*     pApplicationName;
+    uint32_t        applicationVersion;
+    const char*     pEngineName;
+    uint32_t        engineVersion;
+    uint32_t        apiVersion;
+};
+
+struct VkInstanceCreateInfo {
+    VkStructureType          sType;
+    const void*              pNext;
+    VkFlags                  flags;
+    const VkApplicationInfo* pApplicationInfo;
+    uint32_t                 enabledLayerCount;
+    const char* const*       ppEnabledLayerNames;
+    uint32_t                 enabledExtensionCount;
+    const char* const*       ppEnabledExtensionNames;
+};
+
+struct VkPhysicalDeviceProperties2Local {
+    VkStructureType sType;
+    void*           pNext;
+    uint32_t        apiVersion;
+    uint32_t        driverVersion;
+    uint32_t        vendorID;
+    uint32_t        deviceID;
+    uint32_t        deviceType;
+    char            deviceName[256];
+    uint8_t         pipelineCacheUUID[16];
+    uint64_t        limitsAndSparsePadding[128]; // >= sizeof(VkPhysicalDeviceLimits + VkPhysicalDeviceSparseProperties)
+};
+
+struct VkPhysicalDeviceFeatures2Local {
+    VkStructureType sType;
+    void*           pNext;
+    VkBool32        features[64]; // >= 55 VkBool32 fields in VkPhysicalDeviceFeatures
+};
+
+struct VkPhysicalDeviceSubgroupProperties {
+    VkStructureType sType;
+    void*           pNext;
+    uint32_t        subgroupSize;
+    VkFlags         supportedStages;
+    VkFlags         supportedOperations;
+    VkBool32        quadOperationsInAllStages;
+};
+
+struct VkPhysicalDeviceSubgroupSizeControlProperties {
+    VkStructureType sType;
+    void*           pNext;
+    uint32_t        minSubgroupSize;
+    uint32_t        maxSubgroupSize;
+    uint32_t        maxComputeWorkgroupSubgroups;
+    VkFlags         requiredSubgroupSizeStages;
+};
+
+struct VkPhysicalDeviceSubgroupSizeControlFeatures {
+    VkStructureType sType;
+    void*           pNext;
+    VkBool32        subgroupSizeControl;
+    VkBool32        computeFullSubgroups;
+};
+
+struct VkPhysicalDeviceVulkan13Features {
+    VkStructureType sType;
+    void*           pNext;
+    VkBool32        robustImageAccess;
+    VkBool32        inlineUniformBlock;
+    VkBool32        descriptorBindingInlineUniformBlockUpdateAfterBind;
+    VkBool32        pipelineCreationCacheControl;
+    VkBool32        privateData;
+    VkBool32        shaderDemoteToHelperInvocation;
+    VkBool32        shaderTerminateInvocation;
+    VkBool32        subgroupSizeControl;
+    VkBool32        computeFullSubgroups;
+    VkBool32        synchronization2;
+    VkBool32        textureCompressionASTC_HDR;
+    VkBool32        shaderZeroInitializeWorkgroupMemory;
+    VkBool32        dynamicRendering;
+    VkBool32        shaderIntegerDotProduct;
+    VkBool32        maintenance4;
+};
+
+struct VkDeviceCreateInfo {
+    VkStructureType    sType;
+    const void*        pNext;
+    VkFlags            flags;
+    uint32_t           queueCreateInfoCount;
+    const void*        pQueueCreateInfos;
+    uint32_t           enabledLayerCount;
+    const char* const* ppEnabledLayerNames;
+    uint32_t           enabledExtensionCount;
+    const char* const* ppEnabledExtensionNames;
+    const void*        pEnabledFeatures;
+};
+
+struct VkExtensionProperties {
+    char     extensionName[256];
+    uint32_t specVersion;
+};
+
+struct VkShaderModuleCreateInfo {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         flags;
+    size_t          codeSize;
+    const uint32_t* pCode;
+};
+
+struct VkPipelineShaderStageCreateInfo {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         flags;
+    uint32_t        stage;
+    VkShaderModule  module;
+    const char*     pName;
+    const void*     pSpecializationInfo;
+};
+
+struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo {
+    VkStructureType sType;
+    const void*     pNext;
+    uint32_t        requiredSubgroupSize;
+};
+
+struct VkComputePipelineCreateInfo {
+    VkStructureType                 sType;
+    const void*                     pNext;
+    VkFlags                         flags;
+    VkPipelineShaderStageCreateInfo stage;
+    VkPipelineLayout                layout;
+    VkPipeline                      basePipelineHandle;
+    int32_t                         basePipelineIndex;
+};
+
+#if defined(_M_X64) || defined(__x86_64__)
+static_assert(offsetof(VkPhysicalDeviceProperties2Local, apiVersion) == 16, "Properties2 layout");
+static_assert(offsetof(VkPhysicalDeviceSubgroupProperties, subgroupSize) == 16, "SubgroupProperties layout");
+static_assert(offsetof(VkPhysicalDeviceSubgroupSizeControlProperties, requiredSubgroupSizeStages) == 28, "SSCProps layout");
+static_assert(offsetof(VkPhysicalDeviceSubgroupSizeControlFeatures, computeFullSubgroups) == 20, "SSCFeats layout");
+static_assert(offsetof(VkPhysicalDeviceVulkan13Features, subgroupSizeControl) == 44, "Vk13Feats subgroupSizeControl offset");
+static_assert(offsetof(VkPhysicalDeviceVulkan13Features, computeFullSubgroups) == 48, "Vk13Feats computeFullSubgroups offset");
+static_assert(sizeof(VkDeviceCreateInfo) == 72, "VkDeviceCreateInfo size");
+static_assert(sizeof(VkShaderModuleCreateInfo) == 40, "VkShaderModuleCreateInfo size");
+static_assert(sizeof(VkPipelineShaderStageCreateInfo) == 48, "VkPipelineShaderStageCreateInfo size");
+static_assert(sizeof(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo) == 24, "RequiredSubgroupSizeCI size");
+static_assert(sizeof(VkComputePipelineCreateInfo) == 96, "VkComputePipelineCreateInfo size");
+#endif
+
+using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (VK_HOOK_CALL *)(VkInstance, const char*);
+using PFN_vkGetDeviceProcAddr   = PFN_vkVoidFunction (VK_HOOK_CALL *)(VkDevice, const char*);
+using PFN_vkCreateInstance      = VkResult (VK_HOOK_CALL *)(const VkInstanceCreateInfo*, const void*, VkInstance*);
+using PFN_vkDestroyInstance     = void (VK_HOOK_CALL *)(VkInstance, const void*);
+using PFN_vkEnumeratePhysicalDevices = VkResult (VK_HOOK_CALL *)(VkInstance, uint32_t*, VkPhysicalDevice*);
+using PFN_vkGetPhysicalDeviceProperties2 = void (VK_HOOK_CALL *)(VkPhysicalDevice, void*);
+using PFN_vkGetPhysicalDeviceFeatures2   = void (VK_HOOK_CALL *)(VkPhysicalDevice, void*);
+using PFN_vkEnumerateDeviceExtensionProperties = VkResult (VK_HOOK_CALL *)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
+using PFN_vkCreateDevice        = VkResult (VK_HOOK_CALL *)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*);
+using PFN_vkDestroyDevice       = void (VK_HOOK_CALL *)(VkDevice, const void*);
+using PFN_vkCreateShaderModule  = VkResult (VK_HOOK_CALL *)(VkDevice, const VkShaderModuleCreateInfo*, const void*, VkShaderModule*);
+using PFN_vkDestroyShaderModule = void (VK_HOOK_CALL *)(VkDevice, VkShaderModule, const void*);
+using PFN_vkCreateComputePipelines = VkResult (VK_HOOK_CALL *)(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo*, const void*, VkPipeline*);
+
+struct InstanceDispatch {
+    uint32_t                               apiVersion = 0;
+    PFN_vkDestroyInstance                  nextDestroyInstance = nullptr;
+    PFN_vkEnumeratePhysicalDevices         nextEnumeratePhysicalDevices = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2     nextGetPhysicalDeviceProperties2 = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2     nextGetPhysicalDeviceProperties2KHR = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2       nextGetPhysicalDeviceFeatures2 = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2       nextGetPhysicalDeviceFeatures2KHR = nullptr;
+    PFN_vkEnumerateDeviceExtensionProperties nextEnumerateDeviceExtensionProperties = nullptr;
+    PFN_vkCreateDevice                     nextCreateDevice = nullptr;
+    PFN_vkGetDeviceProcAddr                nextGetDeviceProcAddr = nullptr;
+};
+
+struct EligiblePhysDev {
+    bool     needsExt = false;
+    uint32_t physDevApiVersion = 0;
+    uint32_t effectiveApiVersion = 0;
+};
+
+struct EligibleDevice {
+    PFN_vkGetDeviceProcAddr      nextGetDeviceProcAddr = nullptr;
+    PFN_vkCreateShaderModule     nextCreateShaderModule = nullptr;
+    PFN_vkDestroyShaderModule    nextDestroyShaderModule = nullptr;
+    PFN_vkCreateComputePipelines nextCreateComputePipelines = nullptr;
+    PFN_vkDestroyDevice          nextDestroyDevice = nullptr;
+    std::unordered_set<VkShaderModule> matchedModules;
+};
+
+struct BoolRestoreGuard {
+    VkBool32* ptrA = nullptr;
+    VkBool32  origA = 0;
+    VkBool32* ptrB = nullptr;
+    VkBool32  origB = 0;
+    void saveAndSet(VkBool32& a, VkBool32& b) {
+        ptrA = &a; origA = a; a = VK_TRUE_LOCAL;
+        ptrB = &b; origB = b; b = VK_TRUE_LOCAL;
+    }
+    ~BoolRestoreGuard() {
+        if (ptrA) *ptrA = origA;
+        if (ptrB) *ptrB = origB;
+    }
+};
+
+static std::mutex g_mutex;
+static HMODULE    g_patchedModule = nullptr;
+static ULONG_PTR* g_patchedIatSlot = nullptr;
+static PFN_vkGetInstanceProcAddr g_nextGetInstanceProcAddr = nullptr;
+static PFN_vkCreateInstance      g_nextCreateInstance = nullptr;
+static PFN_vkGetDeviceProcAddr   g_fallbackGetDeviceProcAddr = nullptr;
+static PFN_vkCreateShaderModule  g_fallbackCreateShaderModule = nullptr;
+static PFN_vkDestroyShaderModule g_fallbackDestroyShaderModule = nullptr;
+static PFN_vkCreateComputePipelines g_fallbackCreateComputePipelines = nullptr;
+static PFN_vkDestroyDevice       g_fallbackDestroyDevice = nullptr;
+static VkInstance g_latestInstance = nullptr;
+
+static std::unordered_map<VkInstance, InstanceDispatch>     g_instances;
+static std::unordered_map<VkPhysicalDevice, VkInstance>     g_physDevToInstance;
+static std::unordered_map<VkPhysicalDevice, EligiblePhysDev> g_eligiblePhysDevs;
+static std::unordered_set<VkPhysicalDevice>                 g_ineligiblePhysDevs;
+static std::unordered_map<VkDevice, EligibleDevice>         g_eligibleDevices;
+
+static bool isVulkan13OrNewer(uint32_t apiVersion) {
+    uint32_t major = (apiVersion >> 22) & 0x7Fu;
+    uint32_t minor = (apiVersion >> 12) & 0x3FFu;
+    return (major > 1u) || (major == 1u && minor >= 3u);
+}
+
+static bool isEnvEnabled() {
+    char buf[64] = {};
+    DWORD len = GetEnvironmentVariableA("REMIX_AMD_SPARSE_WAVE32", buf, (DWORD)sizeof(buf));
+    if (len == 0 || len >= sizeof(buf)) {
+        return true; // default ON
+    }
+    if (strcmp(buf, "0") == 0 || _stricmp(buf, "false") == 0 || _stricmp(buf, "off") == 0) {
+        LogBridge("[RemixBridge-AMD] Sparse Wave32 Vulkan hook disabled via REMIX_AMD_SPARSE_WAVE32=%s\n", buf);
+        return false;
+    }
+    return true;
+}
+
+struct SpirvMatchResult {
+    bool matched = false;
+    bool hasBallot = false;
+    bool hasKnownName = false;
+};
+
+// Safely scan SPIR-V words to identify RTX Remix's Wave32-dependent
+// compact_active_pixels compute shader (GLCompute, LocalSize(32,32,1),
+// plus OpGroupNonUniformBallot or known OpName debug symbols).
+static SpirvMatchResult matchSparseCompactShader(const uint32_t* words, size_t codeSize) {
+    SpirvMatchResult res;
+    if (!words || codeSize < 20 || (codeSize % 4) != 0) {
+        return res;
+    }
+    static constexpr uint32_t kSpvMagic = 0x07230203u;
+    static constexpr uint16_t kOpName = 5u;
+    static constexpr uint16_t kOpEntryPoint = 15u;
+    static constexpr uint16_t kOpExecutionMode = 16u;
+    static constexpr uint16_t kOpGroupNonUniformBallot = 339u;
+    static constexpr uint32_t kExecModelGLCompute = 5u;
+    static constexpr uint32_t kExecModeLocalSize = 17u;
+
+    if (words[0] != kSpvMagic) {
+        return res;
+    }
+
+    const size_t wordCount = codeSize / 4;
+    std::vector<uint32_t> computeEntries;
+    bool isGLCompute = false;
+    bool hasLocalSize32x32x1 = false;
+
+    size_t i = 5;
+    while (i < wordCount) {
+        uint32_t insn = words[i];
+        uint16_t opcode = (uint16_t)(insn & 0xFFFFu);
+        uint16_t len = (uint16_t)(insn >> 16);
+        if (len == 0 || i + (size_t)len > wordCount) {
+            return SpirvMatchResult{};
+        }
+
+        if (opcode == kOpEntryPoint && len >= 4) {
+            if (words[i + 1] == kExecModelGLCompute) {
+                isGLCompute = true;
+                computeEntries.push_back(words[i + 2]);
+            }
+        } else if (opcode == kOpExecutionMode && len >= 6) {
+            if (words[i + 2] == kExecModeLocalSize &&
+                words[i + 3] == 32u &&
+                words[i + 4] == 32u &&
+                words[i + 5] == 1u) {
+                uint32_t targetId = words[i + 1];
+                for (uint32_t epId : computeEntries) {
+                    if (epId == targetId) {
+                        hasLocalSize32x32x1 = true;
+                        break;
+                    }
+                }
+            }
+        } else if (opcode == kOpGroupNonUniformBallot) {
+            res.hasBallot = true;
+        } else if (opcode == kOpName && len >= 3 && !res.hasKnownName) {
+            const char* raw = reinterpret_cast<const char*>(&words[i + 2]);
+            size_t maxBytes = (size_t)(len - 2u) * 4u;
+            size_t strLen = strnlen(raw, maxBytes);
+            std::string_view sv(raw, strLen);
+            if (sv.find("s_blockActiveMask") != std::string_view::npos ||
+                sv.find("TraceRaysIndirectArgs") != std::string_view::npos) {
+                res.hasKnownName = true;
+            }
+        }
+
+        i += (size_t)len;
+    }
+
+    res.matched = isGLCompute && hasLocalSize32x32x1 && (res.hasBallot || res.hasKnownName);
+    return res;
+}
+
+static bool hasDeviceExtension(PFN_vkEnumerateDeviceExtensionProperties enumExtFn,
+                               VkPhysicalDevice physDev,
+                               const char* targetExt) {
+    if (!enumExtFn || !targetExt) return false;
+    uint32_t count = 0;
+    VkResult rc = enumExtFn(physDev, nullptr, &count, nullptr);
+    if (rc != VK_SUCCESS_LOCAL || count == 0) return false;
+    std::vector<VkExtensionProperties> exts(count);
+    rc = enumExtFn(physDev, nullptr, &count, exts.data());
+    if (rc != VK_SUCCESS_LOCAL && rc != VK_INCOMPLETE_LOCAL) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        exts[i].extensionName[255] = '\0';
+        if (strcmp(exts[i].extensionName, targetExt) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static InstanceDispatch* findInstanceForPhysDevLocked(VkPhysicalDevice physDev, VkInstance* outInst) {
+    VkInstance inst = nullptr;
+    auto mapIt = g_physDevToInstance.find(physDev);
+    if (mapIt != g_physDevToInstance.end()) {
+        inst = mapIt->second;
+    } else {
+        inst = g_latestInstance;
+    }
+    if (outInst) *outInst = inst;
+    auto it = g_instances.find(inst);
+    if (it != g_instances.end()) return &it->second;
+    if (!g_instances.empty()) {
+        if (outInst) *outInst = g_instances.begin()->first;
+        return &g_instances.begin()->second;
+    }
+    return nullptr;
+}
+
+static void handleGetPhysicalDeviceProperties2(VkPhysicalDevice physDev, void* pProperties, bool isKhr) {
+    PFN_vkGetPhysicalDeviceProperties2 nextProps2 = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2   nextFeats2 = nullptr;
+    PFN_vkEnumerateDeviceExtensionProperties nextEnumDevExt = nullptr;
+    PFN_vkGetInstanceProcAddr nextGipa = nullptr;
+    VkInstance inst = nullptr;
+    uint32_t instApiVersion = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        nextGipa = g_nextGetInstanceProcAddr;
+        if (InstanceDispatch* d = findInstanceForPhysDevLocked(physDev, &inst)) {
+            nextProps2 = isKhr ? d->nextGetPhysicalDeviceProperties2KHR
+                               : d->nextGetPhysicalDeviceProperties2;
+            if (!nextProps2) {
+                nextProps2 = d->nextGetPhysicalDeviceProperties2
+                                 ? d->nextGetPhysicalDeviceProperties2
+                                 : d->nextGetPhysicalDeviceProperties2KHR;
+            }
+            nextFeats2 = d->nextGetPhysicalDeviceFeatures2
+                             ? d->nextGetPhysicalDeviceFeatures2
+                             : d->nextGetPhysicalDeviceFeatures2KHR;
+            nextEnumDevExt = d->nextEnumerateDeviceExtensionProperties;
+            instApiVersion = d->apiVersion;
+        }
+    }
+
+    if (!nextProps2) return;
+    nextProps2(physDev, pProperties);
+    if (!pProperties) return;
+
+    auto* props2 = reinterpret_cast<VkPhysicalDeviceProperties2Local*>(pProperties);
+    VkPhysicalDeviceSubgroupProperties* subgroupProps = nullptr;
+    const VkPhysicalDeviceSubgroupSizeControlProperties* existingSscProps = nullptr;
+
+    VkBaseOutStructure* cur = reinterpret_cast<VkBaseOutStructure*>(props2->pNext);
+    for (int depth = 0; cur && depth < kMaxPNextDepth; cur = cur->pNext, ++depth) {
+        if (cur->sType == VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES) {
+            subgroupProps = reinterpret_cast<VkPhysicalDeviceSubgroupProperties*>(cur);
+        } else if (cur->sType == VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES ||
+                   cur->sType == VK_STYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES) {
+            // Note: VkPhysicalDeviceVulkan13Properties begins with the exact same 4
+            // subgroupSizeControl fields at offsets +16..+28.
+            existingSscProps = reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlProperties*>(cur);
+        }
+    }
+
+    if (!subgroupProps) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_eligiblePhysDevs.find(physDev) != g_eligiblePhysDevs.end()) {
+            subgroupProps->subgroupSize = 32u;
+            return;
+        }
+        if (g_ineligiblePhysDevs.find(physDev) != g_ineligiblePhysDevs.end()) {
+            return;
+        }
+    }
+
+    if (subgroupProps->subgroupSize != 64u) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            shouldLog = g_ineligiblePhysDevs.insert(physDev).second;
+        }
+        if (shouldLog) {
+            LogBridge("[RemixBridge-AMD] Sparse Wave32: physDev=%p already reports subgroupSize=%u (no patch needed)\n",
+                      (void*)physDev, subgroupProps->subgroupSize);
+        }
+        return;
+    }
+
+    // Lazily resolve helper instance procs outside our mutex if needed.
+    if (nextGipa && inst) {
+        if (!nextFeats2) {
+            nextFeats2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                nextGipa(inst, "vkGetPhysicalDeviceFeatures2"));
+            if (!nextFeats2) {
+                nextFeats2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                    nextGipa(inst, "vkGetPhysicalDeviceFeatures2KHR"));
+            }
+        }
+        if (!nextEnumDevExt) {
+            nextEnumDevExt = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                nextGipa(inst, "vkEnumerateDeviceExtensionProperties"));
+        }
+    }
+
+    VkPhysicalDeviceSubgroupSizeControlProperties sscProps = {};
+    if (existingSscProps) {
+        sscProps = *existingSscProps;
+    } else {
+        sscProps.sType = VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+        sscProps.pNext = nullptr;
+        VkPhysicalDeviceProperties2Local localProps2 = {};
+        localProps2.sType = VK_STYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        localProps2.pNext = &sscProps;
+        nextProps2(physDev, &localProps2);
+    }
+
+    VkPhysicalDeviceSubgroupSizeControlFeatures sscFeats = {};
+    if (nextFeats2) {
+        sscFeats.sType = VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+        sscFeats.pNext = nullptr;
+        VkPhysicalDeviceFeatures2Local localFeats2 = {};
+        localFeats2.sType = VK_STYPE_PHYSICAL_DEVICE_FEATURES_2;
+        localFeats2.pNext = &sscFeats;
+        nextFeats2(physDev, &localFeats2);
+    }
+
+    const uint32_t physDevApiVersion = props2->apiVersion;
+    const uint32_t effectiveApiVersion =
+        (instApiVersion != 0 && instApiVersion < physDevApiVersion)
+            ? instApiVersion
+            : physDevApiVersion;
+    const bool needsExt = !isVulkan13OrNewer(effectiveApiVersion);
+    const bool extOk = !needsExt || hasDeviceExtension(nextEnumDevExt, physDev, kSubgroupSizeControlExtName);
+
+    const bool propsOk =
+        sscProps.minSubgroupSize > 0u &&
+        sscProps.minSubgroupSize <= 32u &&
+        sscProps.maxSubgroupSize >= 32u &&
+        sscProps.maxComputeWorkgroupSubgroups >= 32u &&
+        (sscProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT_LOCAL) != 0u;
+    const bool featsOk =
+        sscFeats.subgroupSizeControl != VK_FALSE_LOCAL &&
+        sscFeats.computeFullSubgroups != VK_FALSE_LOCAL;
+
+    if (propsOk && featsOk && extOk) {
+        subgroupProps->subgroupSize = 32u;
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            EligiblePhysDev state;
+            state.needsExt = needsExt;
+            state.physDevApiVersion = physDevApiVersion;
+            state.effectiveApiVersion = effectiveApiVersion;
+            shouldLog = g_eligiblePhysDevs.emplace(physDev, state).second;
+        }
+        if (shouldLog) {
+            LogBridge("[RemixBridge-AMD] Sparse Wave32: physDev=%p subgroupSize 64 -> 32 "
+                      "(min=%u max=%u maxWorkgroupSubgroups=%u stages=0x%x ssc=%u full=%u api=0x%x needsExt=%d)\n",
+                      (void*)physDev,
+                      sscProps.minSubgroupSize,
+                      sscProps.maxSubgroupSize,
+                      sscProps.maxComputeWorkgroupSubgroups,
+                      sscProps.requiredSubgroupSizeStages,
+                      sscFeats.subgroupSizeControl,
+                      sscFeats.computeFullSubgroups,
+                      effectiveApiVersion,
+                      needsExt ? 1 : 0);
+        }
+    } else {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            shouldLog = g_ineligiblePhysDevs.insert(physDev).second;
+        }
+        if (shouldLog) {
+            LogBridge("[RemixBridge-AMD] Sparse Wave32: skipped physDev=%p (subgroupSize=64, "
+                      "min=%u max=%u maxWorkgroupSubgroups=%u stages=0x%x ssc=%u full=%u api=0x%x extOk=%d)\n",
+                      (void*)physDev,
+                      sscProps.minSubgroupSize,
+                      sscProps.maxSubgroupSize,
+                      sscProps.maxComputeWorkgroupSubgroups,
+                      sscProps.requiredSubgroupSizeStages,
+                      sscFeats.subgroupSizeControl,
+                      sscFeats.computeFullSubgroups,
+                      effectiveApiVersion,
+                      extOk ? 1 : 0);
+        }
+    }
+}
+
+static void VK_HOOK_CALL Hook_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physDev, void* pProperties) {
+    handleGetPhysicalDeviceProperties2(physDev, pProperties, false);
+}
+
+static void VK_HOOK_CALL Hook_vkGetPhysicalDeviceProperties2KHR(VkPhysicalDevice physDev, void* pProperties) {
+    handleGetPhysicalDeviceProperties2(physDev, pProperties, true);
+}
+
+static VkResult VK_HOOK_CALL Hook_vkCreateInstance(
+    const VkInstanceCreateInfo* pCreateInfo,
+    const void* pAllocator,
+    VkInstance* pInstance)
+{
+    PFN_vkCreateInstance nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        nextFn = g_nextCreateInstance;
+    }
+    if (!nextFn) return VK_ERROR_INITIALIZATION_FAILED_LOCAL;
+
+    VkResult rc = nextFn(pCreateInfo, pAllocator, pInstance);
+    if (rc == VK_SUCCESS_LOCAL && pInstance && *pInstance) {
+        uint32_t apiVersion = 0x00400000u; // VK_API_VERSION_1_0 default
+        if (pCreateInfo && pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->apiVersion != 0) {
+            apiVersion = pCreateInfo->pApplicationInfo->apiVersion;
+        }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[*pInstance].apiVersion = apiVersion;
+        g_latestInstance = *pInstance;
+    }
+    return rc;
+}
+
+static void VK_HOOK_CALL Hook_vkDestroyInstance(VkInstance instance, const void* pAllocator) {
+    PFN_vkDestroyInstance nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_instances.find(instance);
+        if (it != g_instances.end()) {
+            nextFn = it->second.nextDestroyInstance;
+            g_instances.erase(it);
+        }
+        for (auto pit = g_physDevToInstance.begin(); pit != g_physDevToInstance.end(); ) {
+            if (pit->second == instance) {
+                g_eligiblePhysDevs.erase(pit->first);
+                g_ineligiblePhysDevs.erase(pit->first);
+                pit = g_physDevToInstance.erase(pit);
+            } else {
+                ++pit;
+            }
+        }
+        if (g_latestInstance == instance) {
+            g_latestInstance = g_instances.empty() ? nullptr : g_instances.begin()->first;
+        }
+    }
+    if (nextFn) nextFn(instance, pAllocator);
+}
+
+static VkResult VK_HOOK_CALL Hook_vkEnumeratePhysicalDevices(
+    VkInstance instance,
+    uint32_t* pPhysicalDeviceCount,
+    VkPhysicalDevice* pPhysicalDevices)
+{
+    PFN_vkEnumeratePhysicalDevices nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_instances.find(instance);
+        if (it != g_instances.end()) {
+            nextFn = it->second.nextEnumeratePhysicalDevices;
+        }
+    }
+    if (!nextFn) return VK_ERROR_INITIALIZATION_FAILED_LOCAL;
+
+    VkResult rc = nextFn(instance, pPhysicalDeviceCount, pPhysicalDevices);
+    if ((rc == VK_SUCCESS_LOCAL || rc == VK_INCOMPLETE_LOCAL) &&
+        pPhysicalDeviceCount && pPhysicalDevices) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (uint32_t i = 0; i < *pPhysicalDeviceCount; ++i) {
+            if (pPhysicalDevices[i]) {
+                g_physDevToInstance[pPhysicalDevices[i]] = instance;
+            }
+        }
+    }
+    return rc;
+}
+
+static VkResult VK_HOOK_CALL Hook_vkCreateDevice(
+    VkPhysicalDevice physicalDevice,
+    const VkDeviceCreateInfo* pCreateInfo,
+    const void* pAllocator,
+    VkDevice* pDevice)
+{
+    PFN_vkCreateDevice nextCreateDevice = nullptr;
+    PFN_vkGetDeviceProcAddr nextGDPA = nullptr;
+    PFN_vkGetInstanceProcAddr nextGipa = nullptr;
+    VkInstance inst = nullptr;
+    bool isEligible = false;
+    EligiblePhysDev physState = {};
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        nextGipa = g_nextGetInstanceProcAddr;
+        if (InstanceDispatch* d = findInstanceForPhysDevLocked(physicalDevice, &inst)) {
+            nextCreateDevice = d->nextCreateDevice;
+            nextGDPA = d->nextGetDeviceProcAddr;
+        }
+        auto eit = g_eligiblePhysDevs.find(physicalDevice);
+        if (eit != g_eligiblePhysDevs.end()) {
+            isEligible = true;
+            physState = eit->second;
+        }
+    }
+
+    if (!nextCreateDevice) return VK_ERROR_INITIALIZATION_FAILED_LOCAL;
+    if (!isEligible || !pCreateInfo) {
+        return nextCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
+
+    VkPhysicalDeviceVulkan13Features* existingVk13 = nullptr;
+    VkPhysicalDeviceSubgroupSizeControlFeatures* existingSsc = nullptr;
+
+    const VkBaseInStructure* cur = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
+    for (int depth = 0; cur && depth < kMaxPNextDepth; cur = cur->pNext, ++depth) {
+        if (cur->sType == VK_STYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) {
+            existingVk13 = const_cast<VkPhysicalDeviceVulkan13Features*>(
+                reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>(cur));
+        } else if (cur->sType == VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES) {
+            existingSsc = const_cast<VkPhysicalDeviceSubgroupSizeControlFeatures*>(
+                reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlFeatures*>(cur));
+        }
+    }
+
+    VkDeviceCreateInfo modifiedCI = *pCreateInfo;
+    VkPhysicalDeviceSubgroupSizeControlFeatures localSsc = {};
+    BoolRestoreGuard restoreGuard;
+    const char* mode = "unknown";
+
+    if (existingVk13) {
+        // Vulkan 1.3 VUID: never chain VkPhysicalDeviceSubgroupSizeControlFeatures
+        // alongside VkPhysicalDeviceVulkan13Features in the same pNext.
+        if (existingVk13->subgroupSizeControl == VK_FALSE_LOCAL ||
+            existingVk13->computeFullSubgroups == VK_FALSE_LOCAL) {
+            restoreGuard.saveAndSet(existingVk13->subgroupSizeControl, existingVk13->computeFullSubgroups);
+            mode = "existing-vk13-enabled";
+        } else {
+            mode = "existing-vk13-already-on";
+        }
+    } else if (existingSsc) {
+        // Avoid duplicating sType = 1000225002.
+        if (existingSsc->subgroupSizeControl == VK_FALSE_LOCAL ||
+            existingSsc->computeFullSubgroups == VK_FALSE_LOCAL) {
+            restoreGuard.saveAndSet(existingSsc->subgroupSizeControl, existingSsc->computeFullSubgroups);
+            mode = "existing-ssc-enabled";
+        } else {
+            mode = "existing-ssc-already-on";
+        }
+    } else {
+        localSsc.sType = VK_STYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+        localSsc.pNext = const_cast<void*>(modifiedCI.pNext);
+        localSsc.subgroupSizeControl = VK_TRUE_LOCAL;
+        localSsc.computeFullSubgroups = VK_TRUE_LOCAL;
+        modifiedCI.pNext = &localSsc;
+        mode = "chained-ssc";
+    }
+
+    std::vector<const char*> extensions;
+    bool addedExt = false;
+    if (physState.needsExt && !existingVk13) {
+        bool hasExt = false;
+        if (modifiedCI.ppEnabledExtensionNames) {
+            for (uint32_t i = 0; i < modifiedCI.enabledExtensionCount; ++i) {
+                if (modifiedCI.ppEnabledExtensionNames[i] &&
+                    strcmp(modifiedCI.ppEnabledExtensionNames[i], kSubgroupSizeControlExtName) == 0) {
+                    hasExt = true;
+                    break;
+                }
+            }
+        }
+        if (!hasExt) {
+            extensions.reserve((size_t)modifiedCI.enabledExtensionCount + 1u);
+            for (uint32_t i = 0; i < modifiedCI.enabledExtensionCount; ++i) {
+                extensions.push_back(modifiedCI.ppEnabledExtensionNames[i]);
+            }
+            extensions.push_back(kSubgroupSizeControlExtName);
+            modifiedCI.enabledExtensionCount = (uint32_t)extensions.size();
+            modifiedCI.ppEnabledExtensionNames = extensions.data();
+            addedExt = true;
+        }
+    }
+
+    VkResult rc = nextCreateDevice(physicalDevice, &modifiedCI, pAllocator, pDevice);
+
+    if (rc == VK_SUCCESS_LOCAL && pDevice && *pDevice) {
+        if (!nextGDPA && nextGipa && inst) {
+            nextGDPA = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                nextGipa(inst, "vkGetDeviceProcAddr"));
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (!nextGDPA) nextGDPA = g_fallbackGetDeviceProcAddr;
+            g_eligibleDevices[*pDevice].nextGetDeviceProcAddr = nextGDPA;
+        }
+        LogBridge("[RemixBridge-AMD] Sparse Wave32: vkCreateDevice ok (physDev=%p -> device=%p, mode=%s, addedExt=%d)\n",
+                  (void*)physicalDevice, (void*)*pDevice, mode, addedExt ? 1 : 0);
+    } else {
+        LogBridge("[RemixBridge-AMD] Sparse Wave32: vkCreateDevice failed (physDev=%p, mode=%s, addedExt=%d, VkResult=%d)\n",
+                  (void*)physicalDevice, mode, addedExt ? 1 : 0, (int)rc);
+    }
+
+    return rc;
+}
+
+static VkResult VK_HOOK_CALL Hook_vkCreateShaderModule(
+    VkDevice device,
+    const VkShaderModuleCreateInfo* pCreateInfo,
+    const void* pAllocator,
+    VkShaderModule* pShaderModule)
+{
+    PFN_vkCreateShaderModule nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_eligibleDevices.find(device);
+        if (it != g_eligibleDevices.end()) {
+            nextFn = it->second.nextCreateShaderModule;
+        }
+        if (!nextFn) nextFn = g_fallbackCreateShaderModule;
+    }
+    if (!nextFn) return VK_ERROR_INITIALIZATION_FAILED_LOCAL;
+
+    VkResult rc = nextFn(device, pCreateInfo, pAllocator, pShaderModule);
+    if (rc == VK_SUCCESS_LOCAL && pShaderModule && *pShaderModule != 0 &&
+        pCreateInfo && pCreateInfo->pCode) {
+        SpirvMatchResult match = matchSparseCompactShader(pCreateInfo->pCode, pCreateInfo->codeSize);
+        if (match.matched) {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = g_eligibleDevices.find(device);
+                if (it != g_eligibleDevices.end()) {
+                    it->second.matchedModules.insert(*pShaderModule);
+                }
+            }
+            LogBridge("[RemixBridge-AMD] Sparse Wave32: matched compact compute shader module=0x%llx "
+                      "(codeSize=%zu, ballot=%d, knownName=%d)\n",
+                      (unsigned long long)*pShaderModule,
+                      pCreateInfo->codeSize,
+                      match.hasBallot ? 1 : 0,
+                      match.hasKnownName ? 1 : 0);
+        } else {
+            // Defend against driver handle reuse if a prior matched handle was ever destroyed untracked.
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_eligibleDevices.find(device);
+            if (it != g_eligibleDevices.end() && !it->second.matchedModules.empty()) {
+                it->second.matchedModules.erase(*pShaderModule);
+            }
+        }
+    }
+    return rc;
+}
+
+static void VK_HOOK_CALL Hook_vkDestroyShaderModule(
+    VkDevice device,
+    VkShaderModule shaderModule,
+    const void* pAllocator)
+{
+    PFN_vkDestroyShaderModule nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_eligibleDevices.find(device);
+        if (it != g_eligibleDevices.end()) {
+            nextFn = it->second.nextDestroyShaderModule;
+            if (shaderModule != 0) {
+                it->second.matchedModules.erase(shaderModule);
+            }
+        }
+        if (!nextFn) nextFn = g_fallbackDestroyShaderModule;
+    }
+    if (nextFn) nextFn(device, shaderModule, pAllocator);
+}
+
+static VkResult VK_HOOK_CALL Hook_vkCreateComputePipelines(
+    VkDevice device,
+    VkPipelineCache pipelineCache,
+    uint32_t createInfoCount,
+    const VkComputePipelineCreateInfo* pCreateInfos,
+    const void* pAllocator,
+    VkPipeline* pPipelines)
+{
+    PFN_vkCreateComputePipelines nextFn = nullptr;
+    std::vector<uint32_t> matchedIndices;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_eligibleDevices.find(device);
+        if (it != g_eligibleDevices.end()) {
+            nextFn = it->second.nextCreateComputePipelines;
+            if (pCreateInfos && createInfoCount > 0 && !it->second.matchedModules.empty()) {
+                for (uint32_t i = 0; i < createInfoCount; ++i) {
+                    if (pCreateInfos[i].stage.stage == VK_SHADER_STAGE_COMPUTE_BIT_LOCAL &&
+                        pCreateInfos[i].stage.module != 0 &&
+                        it->second.matchedModules.count(pCreateInfos[i].stage.module) > 0) {
+                        matchedIndices.push_back(i);
+                    }
+                }
+            }
+        }
+        if (!nextFn) nextFn = g_fallbackCreateComputePipelines;
+    }
+    if (!nextFn) return VK_ERROR_INITIALIZATION_FAILED_LOCAL;
+
+    if (matchedIndices.empty()) {
+        return nextFn(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+    }
+
+    std::vector<VkComputePipelineCreateInfo> clonedInfos(pCreateInfos, pCreateInfos + createInfoCount);
+    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> reqSubgroupInfos;
+    // Reserve upfront so vector backing store never reallocates and pNext pointers remain valid.
+    reqSubgroupInfos.reserve(matchedIndices.size());
+
+    std::vector<bool> chainedFlag(matchedIndices.size(), false);
+    for (size_t k = 0; k < matchedIndices.size(); ++k) {
+        auto& stage = clonedInfos[matchedIndices[k]].stage;
+        bool alreadyHasReq = false;
+        const VkBaseInStructure* cur = reinterpret_cast<const VkBaseInStructure*>(stage.pNext);
+        for (int depth = 0; cur && depth < kMaxPNextDepth; cur = cur->pNext, ++depth) {
+            if (cur->sType == VK_STYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CI) {
+                alreadyHasReq = true;
+                break;
+            }
+        }
+        if (!alreadyHasReq) {
+            // VUID-VkPipelineShaderStageCreateInfo-flags-02755: REQUIRE_FULL_SUBGROUPS_BIT
+            // and ALLOW_VARYING_SUBGROUP_SIZE_BIT cannot both be set with requiredSubgroupSize.
+            stage.flags = (stage.flags & ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_LOCAL) |
+                          VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_LOCAL;
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo req = {};
+            req.sType = VK_STYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CI;
+            req.pNext = stage.pNext;
+            req.requiredSubgroupSize = 32u;
+            reqSubgroupInfos.push_back(req);
+            stage.pNext = &reqSubgroupInfos.back();
+            chainedFlag[k] = true;
+        }
+    }
+
+    VkResult rc = nextFn(device, pipelineCache, createInfoCount, clonedInfos.data(), pAllocator, pPipelines);
+
+    for (size_t k = 0; k < matchedIndices.size(); ++k) {
+        const uint32_t idx = matchedIndices[k];
+        const auto& stage = clonedInfos[idx].stage;
+        LogBridge("[RemixBridge-AMD] Sparse Wave32: vkCreateComputePipelines idx=%u/%u module=0x%llx "
+                  "entry=%s patched=%d requiredSubgroupSize=32 flags=0x%x -> VkResult=%d\n",
+                  idx, createInfoCount,
+                  (unsigned long long)stage.module,
+                  stage.pName ? stage.pName : "<null>",
+                  chainedFlag[k] ? 1 : 0,
+                  stage.flags,
+                  (int)rc);
+    }
+
+    return rc;
+}
+
+static void VK_HOOK_CALL Hook_vkDestroyDevice(VkDevice device, const void* pAllocator) {
+    PFN_vkDestroyDevice nextFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_eligibleDevices.find(device);
+        if (it != g_eligibleDevices.end()) {
+            nextFn = it->second.nextDestroyDevice;
+            g_eligibleDevices.erase(it);
+        }
+        if (!nextFn) nextFn = g_fallbackDestroyDevice;
+    }
+    if (nextFn) nextFn(device, pAllocator);
+}
+
+static PFN_vkVoidFunction VK_HOOK_CALL Hook_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+    PFN_vkGetDeviceProcAddr nextGDPA = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_eligibleDevices.find(device);
+        if (it != g_eligibleDevices.end() && it->second.nextGetDeviceProcAddr) {
+            nextGDPA = it->second.nextGetDeviceProcAddr;
+        } else {
+            nextGDPA = g_fallbackGetDeviceProcAddr;
+        }
+    }
+    if (!nextGDPA) return nullptr;
+
+    PFN_vkVoidFunction nextFn = nextGDPA(device, pName);
+    if (!nextFn || !pName) return nextFn;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_eligibleDevices.find(device);
+    if (it == g_eligibleDevices.end()) {
+        // Non-eligible device (e.g., NVIDIA GPU): zero overhead pass-through.
+        return nextFn;
+    }
+
+    if (strcmp(pName, "vkCreateShaderModule") == 0) {
+        it->second.nextCreateShaderModule = reinterpret_cast<PFN_vkCreateShaderModule>(nextFn);
+        g_fallbackCreateShaderModule = it->second.nextCreateShaderModule;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkCreateShaderModule);
+    }
+    if (strcmp(pName, "vkDestroyShaderModule") == 0) {
+        it->second.nextDestroyShaderModule = reinterpret_cast<PFN_vkDestroyShaderModule>(nextFn);
+        g_fallbackDestroyShaderModule = it->second.nextDestroyShaderModule;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkDestroyShaderModule);
+    }
+    if (strcmp(pName, "vkCreateComputePipelines") == 0) {
+        it->second.nextCreateComputePipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(nextFn);
+        g_fallbackCreateComputePipelines = it->second.nextCreateComputePipelines;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkCreateComputePipelines);
+    }
+    if (strcmp(pName, "vkDestroyDevice") == 0) {
+        it->second.nextDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(nextFn);
+        g_fallbackDestroyDevice = it->second.nextDestroyDevice;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkDestroyDevice);
+    }
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkGetDeviceProcAddr);
+    }
+    return nextFn;
+}
+
+static PFN_vkVoidFunction VK_HOOK_CALL Hook_vkGetInstanceProcAddr(VkInstance instance, const char* pName) {
+    PFN_vkGetInstanceProcAddr nextGipa = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        nextGipa = g_nextGetInstanceProcAddr;
+    }
+    if (!nextGipa) return nullptr;
+
+    PFN_vkVoidFunction nextFn = nextGipa(instance, pName);
+    if (!nextFn || !pName) return nextFn;
+
+    if (strcmp(pName, "vkGetInstanceProcAddr") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkGetInstanceProcAddr);
+    }
+    if (strcmp(pName, "vkCreateInstance") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_nextCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(nextFn);
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkCreateInstance);
+    }
+    if (strcmp(pName, "vkDestroyInstance") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(nextFn);
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkDestroyInstance);
+    }
+    if (strcmp(pName, "vkEnumeratePhysicalDevices") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextEnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(nextFn);
+        if (instance) g_latestInstance = instance;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkEnumeratePhysicalDevices);
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0) {
+        PFN_vkGetPhysicalDeviceFeatures2 f2 = nullptr;
+        PFN_vkGetPhysicalDeviceFeatures2 f2khr = nullptr;
+        PFN_vkEnumerateDeviceExtensionProperties enumExt = nullptr;
+        if (instance) {
+            f2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextGipa(instance, "vkGetPhysicalDeviceFeatures2"));
+            if (!f2) {
+                f2khr = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextGipa(instance, "vkGetPhysicalDeviceFeatures2KHR"));
+            }
+            enumExt = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(nextGipa(instance, "vkEnumerateDeviceExtensionProperties"));
+        }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto& d = g_instances[instance];
+        d.nextGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(nextFn);
+        if (f2) d.nextGetPhysicalDeviceFeatures2 = f2;
+        if (f2khr) d.nextGetPhysicalDeviceFeatures2KHR = f2khr;
+        if (enumExt) d.nextEnumerateDeviceExtensionProperties = enumExt;
+        if (instance) g_latestInstance = instance;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkGetPhysicalDeviceProperties2);
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+        PFN_vkGetPhysicalDeviceFeatures2 f2 = nullptr;
+        PFN_vkGetPhysicalDeviceFeatures2 f2khr = nullptr;
+        PFN_vkEnumerateDeviceExtensionProperties enumExt = nullptr;
+        if (instance) {
+            f2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextGipa(instance, "vkGetPhysicalDeviceFeatures2"));
+            if (!f2) {
+                f2khr = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextGipa(instance, "vkGetPhysicalDeviceFeatures2KHR"));
+            }
+            enumExt = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(nextGipa(instance, "vkEnumerateDeviceExtensionProperties"));
+        }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto& d = g_instances[instance];
+        d.nextGetPhysicalDeviceProperties2KHR = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(nextFn);
+        if (f2) d.nextGetPhysicalDeviceFeatures2 = f2;
+        if (f2khr) d.nextGetPhysicalDeviceFeatures2KHR = f2khr;
+        if (enumExt) d.nextEnumerateDeviceExtensionProperties = enumExt;
+        if (instance) g_latestInstance = instance;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkGetPhysicalDeviceProperties2KHR);
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextGetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextFn);
+        return nextFn;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextGetPhysicalDeviceFeatures2KHR = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(nextFn);
+        return nextFn;
+    }
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextEnumerateDeviceExtensionProperties = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(nextFn);
+        return nextFn;
+    }
+    if (strcmp(pName, "vkCreateDevice") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_instances[instance].nextCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(nextFn);
+        if (instance) g_latestInstance = instance;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkCreateDevice);
+    }
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto fn = reinterpret_cast<PFN_vkGetDeviceProcAddr>(nextFn);
+        g_instances[instance].nextGetDeviceProcAddr = fn;
+        g_fallbackGetDeviceProcAddr = fn;
+        return reinterpret_cast<PFN_vkVoidFunction>(&Hook_vkGetDeviceProcAddr);
+    }
+
+    return nextFn;
+}
+
+static void resetStateLocked() {
+    g_patchedModule = nullptr;
+    g_patchedIatSlot = nullptr;
+    g_nextGetInstanceProcAddr = nullptr;
+    g_nextCreateInstance = nullptr;
+    g_fallbackGetDeviceProcAddr = nullptr;
+    g_fallbackCreateShaderModule = nullptr;
+    g_fallbackDestroyShaderModule = nullptr;
+    g_fallbackCreateComputePipelines = nullptr;
+    g_fallbackDestroyDevice = nullptr;
+    g_latestInstance = nullptr;
+    g_instances.clear();
+    g_physDevToInstance.clear();
+    g_eligiblePhysDevs.clear();
+    g_ineligiblePhysDevs.clear();
+    g_eligibleDevices.clear();
+}
+
+static ULONG_PTR* findModuleIatSlot(HMODULE mod, const char* targetDll, const char* targetFunc) {
+    if (!mod || !targetDll || !targetFunc) return nullptr;
+    auto* base = reinterpret_cast<uint8_t*>(mod);
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    const IMAGE_DATA_DIRECTORY& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (impDir.VirtualAddress == 0 || impDir.Size == 0) return nullptr;
+
+    auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + impDir.VirtualAddress);
+    for (; desc->Name != 0; ++desc) {
+        const char* dllName = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(dllName, targetDll) != 0) continue;
+        if (desc->OriginalFirstThunk == 0 || desc->FirstThunk == 0) continue;
+
+        auto* origThunk = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+        auto* iatThunk  = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
+            auto* byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+            if (strcmp(reinterpret_cast<const char*>(byName->Name), targetFunc) != 0) continue;
+
+            return reinterpret_cast<ULONG_PTR*>(&iatThunk->u1.Function);
+        }
+    }
+    return nullptr;
+}
+
+static void install(HMODULE remixDll) {
+    if (!remixDll) return;
+    if (!isEnvEnabled()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_patchedModule == remixDll && g_patchedIatSlot != nullptr) {
+            return;
+        }
+        resetStateLocked();
+    }
+
+    ULONG_PTR* slot = findModuleIatSlot(remixDll, "vulkan-1.dll", "vkGetInstanceProcAddr");
+    if (!slot) {
+        LogBridge("[RemixBridge-AMD] Sparse Wave32: d3d9.dll IAT vulkan-1.dll!vkGetInstanceProcAddr not found (skipped)\n");
+        return;
+    }
+
+    void* origFn = reinterpret_cast<void*>((uintptr_t)*slot);
+    if (!origFn || origFn == reinterpret_cast<void*>(&Hook_vkGetInstanceProcAddr)) {
+        return;
+    }
+
+    // Publish next pointer before writing IAT slot so no concurrent caller can see null.
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_patchedModule = remixDll;
+        g_patchedIatSlot = slot;
+        g_nextGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(origFn);
+    }
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProt)) {
+        DWORD err = GetLastError();
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            resetStateLocked();
+        }
+        LogBridge("[RemixBridge-AMD] Sparse Wave32: VirtualProtect on d3d9.dll IAT failed (err=%lu)\n", err);
+        return;
+    }
+
+    *slot = (ULONG_PTR)&Hook_vkGetInstanceProcAddr;
+    DWORD dummyProt = 0;
+    VirtualProtect(slot, sizeof(*slot), oldProt, &dummyProt);
+
+    LogBridge("[RemixBridge-AMD] Sparse Wave32: patched d3d9.dll IAT vulkan-1.dll!vkGetInstanceProcAddr (%p -> %p)\n",
+              origFn, (void*)&Hook_vkGetInstanceProcAddr);
+}
+
+static void uninstall(HMODULE remixDll) {
+    ULONG_PTR* slot = nullptr;
+    PFN_vkGetInstanceProcAddr origFn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (remixDll && g_patchedModule == remixDll && g_patchedIatSlot && g_nextGetInstanceProcAddr) {
+            slot = g_patchedIatSlot;
+            origFn = g_nextGetInstanceProcAddr;
+        }
+        resetStateLocked();
+    }
+    if (slot && origFn) {
+        DWORD oldProt = 0;
+        if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProt)) {
+            if (*slot == (ULONG_PTR)&Hook_vkGetInstanceProcAddr) {
+                *slot = (ULONG_PTR)origFn;
+            }
+            DWORD dummyProt = 0;
+            VirtualProtect(slot, sizeof(*slot), oldProt, &dummyProt);
+        }
+    }
+}
+
+#undef VK_HOOK_CALL
+
+} // namespace amd_sparse_wave32
+
 static jint initializeRuntime(const wchar_t* dllPath)
 {
     // Extract parent directory for SetDllDirectoryW
@@ -829,6 +2093,9 @@ static jint initializeRuntime(const wchar_t* dllPath)
         return REMIXAPI_ERROR_CODE_GET_PROC_ADDRESS_FAILURE;
     }
 
+    // Install AMD Sparse Rendering Wave32 hook on d3d9.dll's Vulkan IAT before Remix init.
+    amd_sparse_wave32::install(g_remixDll);
+
     remixapi_InitializeLibraryInfo initInfo = {};
     initInfo.sType   = REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO;
     initInfo.version = REMIXAPI_VERSION_MAKE(
@@ -854,6 +2121,7 @@ static jint initializeRuntime(const wchar_t* dllPath)
                 REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
             fflush(stderr);
             memset(&g_remix, 0, sizeof(g_remix));
+            amd_sparse_wave32::uninstall(g_remixDll);
             FreeLibrary(g_remixDll);
             g_remixDll = nullptr;
             return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
@@ -1028,7 +2296,11 @@ Java_com_nvidia_rtxremix_RemixBridge_shutdown(JNIEnv*, jclass)
     }
     s_wasHostActive = false;
     jint rc = (jint)remixCall([&] { return shutdown(); });
-    if (g_remixDll) { FreeLibrary(g_remixDll); g_remixDll = nullptr; }
+    if (g_remixDll) {
+        amd_sparse_wave32::uninstall(g_remixDll);
+        FreeLibrary(g_remixDll);
+        g_remixDll = nullptr;
+    }
     memset(&g_remix, 0, sizeof(g_remix));
     return rc;
 }
